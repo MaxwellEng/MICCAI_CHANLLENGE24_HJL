@@ -41,7 +41,8 @@ from nnunetv2.ensembling.ensemble import ensemble_folders
 import shutil
 import SimpleITK
 from nnunetv2.imageio.simpleitk_reader_writer import SimpleITKIO
-
+import monai.transforms as transforms
+from monai.data import ITKReader
 class nnUNetPredictor(object):
     def __init__(self,
                  tile_step_size: float = 0.5,
@@ -429,10 +430,11 @@ class nnUNetPredictor(object):
         empty_cache(self.device)
         return ret
 
+    #hjl 0619
     def predict_single_npy_array(self, input_image: np.ndarray, image_properties: dict,
                                  segmentation_previous_stage: np.ndarray = None,
                                  output_file_truncated: str = None,
-                                 save_or_return_probabilities: bool = False):
+                                 save_or_return_probabilities: bool = False, ref_image: np.ndarray = None):
         """
         WARNING: SLOW. ONLY USE THIS IF YOU CANNOT GIVE NNUNET MULTIPLE IMAGES AT ONCE FOR SOME REASON.
 
@@ -446,18 +448,20 @@ class nnUNetPredictor(object):
                      you need to transpose your axes AND your spacing from [x,y,z] to [z,y,x]!
         image_properties must only have a 'spacing' key!
         """
+        #hjl 0619
         ppa = PreprocessAdapterFromNpy([input_image], [segmentation_previous_stage], [image_properties],
                                        [output_file_truncated],
                                        self.plans_manager, self.dataset_json, self.configuration_manager,
-                                       num_threads_in_multithreaded=1, verbose=self.verbose)
+                                       num_threads_in_multithreaded=1, verbose=self.verbose, ref_image = ref_image)
         if self.verbose:
             print('preprocessing')
         dct = next(ppa)
 
         if self.verbose:
             print('predicting')
+        #hjl--dont transfer to cpu
         predicted_logits = self.predict_logits_from_preprocessed_data(dct['data']).cpu()
-
+        #predicted_logits = self.predict_logits_from_preprocessed_data(dct['data'])
         if self.verbose:
             print('resampling to original shape')
         if output_file_truncated is not None:
@@ -503,7 +507,7 @@ class nnUNetPredictor(object):
             # why not leave prediction on device if perform_everything_on_device? Because this may cause the
             # second iteration to crash due to OOM. Grabbing that with try except cause way more bloated code than
             # this actually saves computation time
-
+            #hjl--dont transfer to cpu
             if prediction is None:
                 prediction = self.predict_sliding_window_return_logits(data).to('cpu')
             else:
@@ -945,6 +949,9 @@ def load_image_file_as_array(*, location):
     input_files = glob(str(location / "*.tiff")) + glob(str(location / "*.mha"))
     result = SimpleITK.ReadImage(input_files[0])
     spacing = result.GetSpacing()
+    img_loader = transforms.LoadImage(reader=ITKReader())
+    ct_voxel_ndarray, meta_data = img_loader(input_files[0])
+    # direction = meta_data['affine'][:3, :3].flatten()[:9]    
     direction = result.GetDirection()
     origin = result.GetOrigin()
     img, props = SimpleITKIO().read_images([input_files[0]])
@@ -955,17 +962,23 @@ def load_image_file_as_array(*, location):
     print('origin:', origin)
     print('props:', props)
     # Convert it to a Numpy array
-    return img, spacing, direction, origin, props
+    from nibabel.orientations import aff2axcodes
+    ori_axcode = aff2axcodes(meta_data['affine'])
+    print('ori_axcode:', ori_axcode)
+    img = np.flip(img, axis=2) 
+    img = np.flip(img, axis=3)   
+    return img, spacing, direction, origin, props, ori_axcode
 
 
 
 
-def write_array_as_image_file(*, location, array, spacing, origin, direction):
+def write_array_as_image_file(*, location, array, spacing, origin, direction, ori_axcode):
     location.mkdir(parents=True, exist_ok=True)
 
     # You may need to change the suffix to .tiff to match the expected output
-    suffix = ".mha"
-
+    suffix = ".mha"    
+    array = np.flip(array, axis=1) 
+    array = np.flip(array, axis=2) 
     image = SimpleITK.GetImageFromArray(array)
     image.SetSpacing(spacing)
     image.SetDirection(direction) # My line
@@ -978,7 +991,108 @@ def write_array_as_image_file(*, location, array, spacing, origin, direction):
         useCompression=True,
     )
 
-def predict_from_folder_aorta24(weight_folder: str, input_folder: str, output_folder: str, result1_path: str, result2_path: str, folds: 0, part_id:0, num_parts:1):
+def _show_torch_cuda_info():
+
+    print("=+=" * 10)
+    print("Collecting Torch CUDA information")
+    print(f"Torch CUDA is available: {(available := torch.cuda.is_available())}")
+    if available:
+        print(f"\tnumber of devices: {torch.cuda.device_count()}")
+        print(f"\tcurrent device: { (current_device := torch.cuda.current_device())}")
+        print(f"\tproperties: {torch.cuda.get_device_properties(current_device)}")
+    print("=+=" * 10)
+
+from skimage import measure
+def largestConnectComponent(arr):
+    arr[arr>0] = 1
+    arr = arr.astype(bool)
+    label_image, num = measure.label(arr, background=0, return_num=True)
+    areas = [r.area for r in measure.regionprops(label_image)]
+    areas.sort()
+    
+    if num > 1:
+        for region in measure.regionprops(label_image):
+            if (region.area < areas[-1]):
+                for coordinates in region.coords:
+                    label_image[coordinates[0], coordinates[1], coordinates[2]] = 0
+    mask = label_image.astype(int)
+    return mask
+
+
+def vote_combine_012(ret0,ret1,ret2):
+    combined = np.zeros_like(ret1)
+    agreement_count = (ret1 == ret0) | (ret1 == ret2) | (ret0 == ret2)
+    agreement_v1 = (ret1 == ret0) | (ret1 == ret2)
+    combined[agreement_v1] = ret1[agreement_v1]
+    combined[agreement_count & ~agreement_v1] = ret0[agreement_count & ~agreement_v1]
+    return combined
+
+def vote_combine_2(ret1,ret2):
+    combined = np.zeros_like(ret1)
+    agreement_all = (ret1 == ret2) #两个都一样
+    combined[agreement_all] = ret1[agreement_all]   
+    agreement_ret1 = (ret1>0) & (combined==0)
+    combined[agreement_ret1] = ret1[agreement_ret1]
+    agreement_ret2 = (ret2>0) & (combined==0)
+    combined[agreement_ret2] = ret2[agreement_ret2]
+    combined_copy = combined.copy()
+    filterd_mask = largestConnectComponent(combined_copy)
+    combined[(filterd_mask == 0) & (agreement_ret1 | agreement_ret2)] = 0
+    return combined
+
+def vote_combine_3(ret1,ret2,ret3):
+    combined = np.zeros_like(ret1)
+    agreement_all = (ret1 == ret2) & (ret1 == ret3) #三个都一样
+    combined[agreement_all] = ret1[agreement_all]
+    #三个里面有超过两个同意的
+    #agreement_2 = (ret0 == ret1) | (ret0 == ret2) | (ret0 == ret3) | (ret1 == ret2) | (ret1 == ret3) | (ret2 == ret3)   
+    agreement_2 = (ret1 == ret3) | (ret2 == ret3)
+    combined[agreement_2 & (combined==0)] = ret3[agreement_2 & (combined==0)]
+    agreement_2 = (ret1 == ret2) | (ret3 == ret2)
+    combined[agreement_2 & (combined==0)] = ret2[agreement_2 & (combined==0)]    
+    # agreement_2 = (ret2 == ret1) | (ret3 == ret1)
+    # combined[agreement_2 & (combined==0)] = ret1[agreement_2 & (combined==0)]
+    #zone1/zone6/SMA(13)/leftRe(16) 鼓励它们提高召回率，先计算一下体积，如果体积小则取并集
+    combined[(ret2==13) | (ret3==13)] =13
+    # combined[(ret0==15) | (ret1==15) | (ret2==15) | (ret3==15)] =15 #new add final one
+    # combined[(ret0==11) | (ret1==11) | (ret2==11) | (ret3==11)] =11 #new add final one
+    # combined[(ret0==21) | (ret1==21) | (ret2==21) | (ret3==21)] =21 #new add final one
+    combined[(ret2==16) | (ret3==16)] =16
+    return combined
+
+#投票
+def vote_combine(ret0,ret1,ret2,ret3):
+    combined = np.zeros_like(ret1)
+    agreement_all = (ret0 == ret1) & (ret0 == ret2) & (ret0 == ret3) #四个都一样
+    combined[agreement_all] = ret1[agreement_all]
+    #四个里面有超过三个同意的
+    agreement_3 = (ret0 == ret1) & (ret0 == ret2) #| (ret0 == ret1) & (ret0 == ret3) | (ret0 == ret2) & (ret0 == ret3) | (ret1 == ret2) & (ret1 == ret3)
+    combined[agreement_3 & (combined==0)] = ret0[agreement_3 & (combined==0)]
+    agreement_3 = (ret0 == ret1) & (ret0 == ret3)
+    combined[agreement_3 & (combined==0)] = ret0[agreement_3 & (combined==0)]
+    agreement_3 = (ret0 == ret2) & (ret0 == ret3)
+    combined[agreement_3 & (combined==0)] = ret0[agreement_3 & (combined==0)]
+    agreement_3 = (ret1 == ret2) & (ret1 == ret3)
+    combined[agreement_3 & (combined==0)] = ret1[agreement_3 & (combined==0)]
+    #四个里面有超过两个同意的
+    #agreement_2 = (ret0 == ret1) | (ret0 == ret2) | (ret0 == ret3) | (ret1 == ret2) | (ret1 == ret3) | (ret2 == ret3)
+    agreement_2 = (ret0 == ret1) | (ret2 == ret1) | (ret3 == ret1)
+    combined[agreement_2 & (combined==0)] = ret1[agreement_2 & (combined==0)]    
+    agreement_2 = (ret0 == ret3) | (ret1 == ret3) | (ret2 == ret3)
+    combined[agreement_2 & (combined==0)] = ret3[agreement_2 & (combined==0)]
+    agreement_2 = (ret0 == ret2) | (ret1 == ret2) | (ret3 == ret2)
+    combined[agreement_2 & (combined==0)] = ret2[agreement_2 & (combined==0)]    
+    agreement_2 = (ret3 == ret0) | (ret1 == ret0) | (ret2 == ret0)
+    combined[agreement_2 & (combined==0)] = ret0[agreement_2 & (combined==0)]
+    #zone1/zone6/SMA(13)/leftRe(16) 鼓励它们提高召回率，先计算一下体积，如果体积小则取并集
+    combined[(ret0==13) | (ret1==13) | (ret2==13) | (ret3==13)] =13
+    # combined[(ret0==15) | (ret1==15) | (ret2==15) | (ret3==15)] =15 #new add final one
+    # combined[(ret0==11) | (ret1==11) | (ret2==11) | (ret3==11)] =11 #new add final one
+    # combined[(ret0==21) | (ret1==21) | (ret2==21) | (ret3==21)] =21 #new add final one
+    combined[(ret0==16) | (ret1==16) | (ret2==16) | (ret3==16)] =16
+    return combined
+
+def predict_from_folder_aorta24(weight_folder: str, input_folder: str, output_folder: str, folds: 0, part_id:0, num_parts:1):
     #maybe_mkdir_p(output_folder)
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -989,70 +1103,83 @@ def predict_from_folder_aorta24(weight_folder: str, input_folder: str, output_fo
 
     #args = parser.parse_args()
     #args.f = [i if i == 'all' else int(i) for i in args.f]
-    
+    _show_torch_cuda_info()
     model_folder = weight_folder
 
     if not isdir(output_folder):
         maybe_mkdir_p(output_folder)
-    
-    predictor1 = nnUNetPredictor(
+
+    img, spacing, direction, origin, props, ori_axcode = load_image_file_as_array(
+        location=INPUT_PATH / "images/ct-angiography",
+    )    
+
+    predictor0 = nnUNetPredictor(
         tile_step_size=0.5,
         use_gaussian=True,
         use_mirroring=False,
         perform_everything_on_device=True,
-        device=torch.device('cuda', 0),
+        device=torch.device('cuda'),
         verbose=False,
         verbose_preprocessing=False,
         allow_tqdm=True
         )
-    predictor1.initialize_from_trained_model_folder(
-        join(model_folder, 'Dataset040_Aortaseg24/nnUNetTrainer__nnUNetResEncUNetMPlans__3d_fullres'),
+    predictor0.initialize_from_trained_model_folder(
+        join(model_folder, 'Dataset040_Aortaseg24/nnUNetTrainer__nnUNetPlans__3d_lowres'),
         use_folds=(0,),
         checkpoint_name='checkpoint_final.pth',
     )
-    # predictor1.predict_from_files(input_folder,
-    #                              result1_path,
-    #                              save_probabilities=False, overwrite=False,
-    #                              num_processes_preprocessing=3, num_processes_segmentation_export=3,
-    #                              folder_with_segs_from_prev_stage=None, num_parts=1, part_id=0)
-    # predict a single numpy array
-    img, spacing, direction, origin, props = load_image_file_as_array(
-        location=INPUT_PATH / "images/ct-angiography",
-    )
-    ret1 = predictor1.predict_single_npy_array(img, props, None, None, True)
+    ret0 = predictor0.predict_single_npy_array(img, props, None, None, False)
+    #empty
+    del predictor0
+    torch.cuda.empty_cache()
 
     predictor2 = nnUNetPredictor(
         tile_step_size=0.5,
         use_gaussian=True,
         use_mirroring=False,
         perform_everything_on_device=True,
-        device=torch.device('cuda', 0),
+        device=torch.device('cuda'),
         verbose=False,
         verbose_preprocessing=False,
         allow_tqdm=True
         )
         
     predictor2.initialize_from_trained_model_folder(
-        join(model_folder, 'Dataset040_Aortaseg24/nnUNetTrainer__nnUNetResEncUNetLPlans__3d_fullres'),
-        use_folds=(1,),
+        join(model_folder, 'Dataset040_Aortaseg24/nnUNetTrainer__nnUNetResEncUNetMPlans__3d_fullres'),
+        use_folds=(0,1,2),
         checkpoint_name='checkpoint_final.pth',
     )
-    # predictor2.predict_from_files(input_folder,
-    #                              result2_path,
-    #                              save_probabilities=False, overwrite=False,
-    #                              num_processes_preprocessing=3, num_processes_segmentation_export=3,
-    #                              folder_with_segs_from_prev_stage=None, num_parts=1, part_id=0)
-    ret2 = predictor2.predict_single_npy_array(img, props, None, None, True)
-    print('the shape of the ret1:', ret1[1].shape)
-    print('the shape of the ret2:', ret2[1].shape)
-    probabilities = (ret1[1] + ret2[1]) / 2
-    print('the shape of the probabilities:', probabilities.shape)
+    # #second try
+    ret2 = predictor2.predict_single_npy_array(img, props, None, None, False, ret0)
+    #empty
+    del predictor2
+    torch.cuda.empty_cache()
 
-    del ret1, ret2
-    ret =  probabilities.argmax(0)
-    del probabilities
-    #ensemble_folders([result1_path, result2_path], output_folder)       
-    print('the shape of the output:', ret.shape)
+    predictor4 = nnUNetPredictor(
+        tile_step_size=0.5,
+        use_gaussian=True,
+        use_mirroring=False,
+        perform_everything_on_device=True,
+        device=torch.device('cuda'),
+        verbose=False,
+        verbose_preprocessing=False,
+        allow_tqdm=True
+        )
+        
+    predictor4.initialize_from_trained_model_folder(
+        join(model_folder, 'Dataset040_Aortaseg24/nnUNetTrainer__nnUNetResEncUNetLPlans__3d_fullres'),
+        use_folds=(4,'all'),
+        checkpoint_name='checkpoint_final.pth',
+    )
+    # #second try
+    ret4 = predictor4.predict_single_npy_array(img, props, None, None, False, ret2)
+    #empty
+    del predictor4
+    del img
+
+    ret = vote_combine_2(ret2,ret4)
+    del ret2, ret4
+    torch.cuda.empty_cache()
     # Save your output
     write_array_as_image_file(
         location=OUTPUT_PATH / "images/aortic-branches",
@@ -1060,37 +1187,32 @@ def predict_from_folder_aorta24(weight_folder: str, input_folder: str, output_fo
         spacing=spacing, 
         direction=direction, 
         origin=origin,
+        ori_axcode = ori_axcode
     )
-    print('Saved!!!')
-
+    del ret
+    print('Saved!!!') 
 
 from pathlib import Path
 INPUT_PATH = Path("/input")
 OUTPUT_PATH = Path("/output")
 RESOURCE_PATH = Path("resources")
-# INPUT_PATH = Path("/mnt/ssd2t/hjl/Aorta24_nnUNet_Example/input")
-# OUTPUT_PATH = Path("/mnt/ssd2t/hjl/Aorta24_nnUNet_Example/output")
-# RESOURCE_PATH = Path("/mnt/ssd2t/hjl/Aorta24_nnUNet_Example/resources")
+# INPUT_PATH = Path("/media/sjtu426/hjl/Aorta24_nnUNet_Example/input")
+# OUTPUT_PATH = Path("/media/sjtu426/hjl/Aorta24_nnUNet_Example/output")
+# RESOURCE_PATH = Path("/media/sjtu426/hjl/Aorta24_nnUNet_Example/resources")
 
 def run():
     #weight_folder = "weight/"
     input_path    = INPUT_PATH / "images/ct-angiography"
-    result_folder = OUTPUT_PATH / "images/aortic-branches"   
-    result1_path  = OUTPUT_PATH / "result1/"
-    result2_path  = OUTPUT_PATH / "result2/"     
+    result_folder = OUTPUT_PATH / "images/aortic-branches"      
     # input_path    = "/home/hjl/Aorta24_nnUNet_Example/input/images/ct-angiography"
     # result_folder = '/home/hjl/Aorta24_nnUNet_Example/output/images/aortic-branches'
     # result1_path  = '/home/hjl/Aorta24_nnUNet_Example/output/result1/'
     # result2_path  = '/home/hjl/Aorta24_nnUNet_Example/output/result2/'
     if not os.path.exists(result_folder):
         os.makedirs(result_folder, exist_ok=True)    
-    if not os.path.exists(result1_path):
-        os.makedirs(result1_path, exist_ok=True)
-    if not os.path.exists(result2_path):
-        os.makedirs(result2_path, exist_ok=True)
     #change_one_hot_label(result1_path,result2_path,result3_path,result4_path,output_folder)
     #PlanA first try
-    predict_from_folder_aorta24(RESOURCE_PATH, input_path, result_folder, result1_path, result2_path, 0, 0, 1) 
+    predict_from_folder_aorta24(RESOURCE_PATH, input_path, result_folder, 0, 0, 1) 
     #predict_from_folder_aorta24(weight_folder, input_path, result_folder,result1_path,result2_path, 0, 0, 1) 
     #write_outputs(uuid, '/home/luoxiangde/Projects/SegRap2023/SegRap2023_TestSet/hjl/outputs/head-neck-segmentation/',result_folder)   
 
